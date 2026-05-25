@@ -1,46 +1,69 @@
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import os
 
-df = pd.read_csv('data/raw/crop_yield.csv')
-df.columns = df.columns.str.strip()
-df = df[df['Crop'].isin(['Rice', 'Wheat'])].copy()
-print(f"Rows after filtering Rice and Wheat: {len(df)}")
-df = df.dropna(subset=['Yield'])
+# Load full crop production dataset
+df = pd.read_csv('data/raw/crop_production.csv')
+print(f"Full dataset loaded: {df.shape}")
 
-df['Potential_Yield'] = df.groupby(['State', 'Crop'])['Yield'].transform(lambda x: x.quantile(0.90))
+# Rename columns to match our pipeline
+df.rename(columns={'State_Name': 'State', 'District_Name': 'District'}, inplace=True)
+
+# Drop rows with missing Production
+df.dropna(subset=['Production'], inplace=True)
+print(f"After dropping nulls: {df.shape}")
+
+# Compute Yield (tonnes/ha)
+df['Yield'] = df['Production'] / df['Area']
+df = df[df['Yield'] > 0]
+df = df[df['Yield'] < df['Yield'].quantile(0.99)]  # remove extreme outliers
+print(f"After cleaning yield outliers: {df.shape}")
+
+# Load soil/NPK data
+soil = pd.read_csv('data/raw/Crop_recommendation.csv')
+print(f"\nSoil dataset loaded: {soil.shape}")
+print(f"Soil columns: {soil.columns.tolist()}")
+
+# Compute potential yield per crop from soil data
+# Use 90th percentile yield per crop as potential
+potential = df.groupby('Crop')['Yield'].quantile(0.90).reset_index()
+potential.columns = ['Crop', 'Potential_Yield']
+print(f"\nPotential yield computed for {len(potential)} crops")
+
+# Merge potential yield
+df = df.merge(potential, on='Crop', how='left')
+
+# Compute Yield Gap
 df['Yield_Gap'] = df['Potential_Yield'] - df['Yield']
-df = df[df['Yield_Gap'] >= 0].copy()
-print(f"Rows after removing negative gaps: {len(df)}")
+df = df[df['Yield_Gap'] >= 0]  # remove rows where yield exceeds potential
 
-# Calculate Gap_Trend without groupby apply
-trends = []
-for (state, crop), group in df.groupby(['State', 'Crop']):
-    if len(group) < 2:
-        slope = 0
-    else:
-        slope = np.polyfit(group['Crop_Year'].values, group['Yield_Gap'].values, 1)[0]
-    trends.append({'State': state, 'Crop': crop, 'Gap_Trend': slope})
+# Merge soil NPK data (average per crop)
+soil_avg = soil.groupby('label').agg({
+    'N': 'mean', 'P': 'mean', 'K': 'mean',
+    'ph': 'mean', 'rainfall': 'mean',
+    'temperature': 'mean', 'humidity': 'mean'
+}).reset_index()
+soil_avg.rename(columns={'label': 'Crop', 'ph': 'pH'}, inplace=True)
 
-trends_df = pd.DataFrame(trends)
-df = df.merge(trends_df, on=['State', 'Crop'], how='left')
+# Normalize crop names for merging
+df['Crop_lower'] = df['Crop'].str.lower().str.strip()
+soil_avg['Crop_lower'] = soil_avg['Crop'].str.lower().str.strip()
+df = df.merge(soil_avg.drop('Crop', axis=1), on='Crop_lower', how='left')
+df.drop('Crop_lower', axis=1, inplace=True)
 
-print(f"\nFinal shape: {df.shape}")
+# Compute Gap Trend (rolling mean gap per state-crop)
+df = df.sort_values(['State', 'Crop', 'Crop_Year'])
+df['Gap_Trend'] = df.groupby(['State', 'Crop'])['Yield_Gap'].transform(
+    lambda x: x.rolling(3, min_periods=1).mean()
+)
+
+# Final cleanup
+df.dropna(subset=['Yield_Gap', 'Potential_Yield'], inplace=True)
+print(f"\nFinal master dataset: {df.shape}")
+print(f"Crops: {df['Crop'].nunique()}")
+print(f"States: {df['State'].nunique()}")
 print(f"Columns: {df.columns.tolist()}")
-print(df[['State', 'Crop', 'Crop_Year', 'Yield', 'Yield_Gap', 'Gap_Trend']].head())
 
-os.makedirs('outputs', exist_ok=True)
-plt.figure(figsize=(8, 4))
-plt.hist(df['Yield_Gap'], bins=40, color='steelblue', edgecolor='white')
-plt.title('Distribution of Yield Gap (Rice & Wheat)')
-plt.xlabel('Yield Gap (kg/ha)')
-plt.ylabel('Frequency')
-plt.tight_layout()
-plt.savefig('outputs/yield_gap_histogram.png')
-print("Histogram saved")
-
-os.makedirs('data/processed', exist_ok=True)
+# Save
 df.to_csv('data/processed/yield_gap_master.csv', index=False)
-print("Saved to data/processed/yield_gap_master.csv")
-print("Stage 3 complete!")
+print("\nSaved: data/processed/yield_gap_master.csv")
+print("Stage 3 (extended) complete!")
